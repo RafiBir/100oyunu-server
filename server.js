@@ -93,7 +93,7 @@ function endRoom(room) {
   room.ended   = true;
   room.rematch = [false, false];
   room.timerInterval = null;
-  setTimeout(() => rooms.delete(room.id), 30000);
+  room._deleteTimeout = setTimeout(() => rooms.delete(room.id), 30000);
 }
 
 function createRoom(p1, p2) {
@@ -223,7 +223,9 @@ wss.on('connection', (ws) => {
       if (opp) wsSend(opp.ws, { type: 'rematchRequest' });
 
       if (room.rematch[0] && room.rematch[1]) {
-        // İkisi de kabul etti — odayı sıfırla ve yeni oyun başlat
+        // İkisi de kabul etti — silme timeout'unu iptal et, odayı sıfırla
+        clearTimeout(room._deleteTimeout);
+        room._deleteTimeout = null;
         room.ended    = false;
         room.scores   = [0, 0];
         room.gameOver = [false, false];
