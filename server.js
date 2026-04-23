@@ -87,10 +87,13 @@ function endRoom(room) {
     const opp  = room.scores[1 - i];
     const winner = mine > opp ? 'you' : opp > mine ? 'opponent' : 'draw';
     wsSend(p.ws, { type: 'result', yourScore: mine, opponentScore: opp, winner });
-    p.ws._roomId = null;
   });
 
-  rooms.delete(room.id);
+  // Odayı 30 saniye rematch için açık tut
+  room.ended   = true;
+  room.rematch = [false, false];
+  room.timerInterval = null;
+  setTimeout(() => rooms.delete(room.id), 30000);
 }
 
 function createRoom(p1, p2) {
@@ -111,12 +114,17 @@ function createRoom(p1, p2) {
 
   rooms.set(id, room);
 
+  startRoomGame(room);
+}
+
+function startRoomGame(room) {
+  const [p1, p2] = room.players;
+
   wsSend(p1.ws, { type: 'matched', opponentNickname: p2.nickname });
   wsSend(p2.ws, { type: 'matched', opponentNickname: p1.nickname });
 
-  // Short countdown then start
   setTimeout(() => {
-    if (!rooms.has(id)) return; // room might have been cleaned up
+    if (!rooms.has(room.id)) return;
     wsSend(p1.ws, { type: 'start' });
     wsSend(p2.ws, { type: 'start' });
 
@@ -199,6 +207,30 @@ wss.on('connection', (ws) => {
       if (opp) wsSend(opp.ws, { type: 'opponentNoMoves' });
 
       if (room.gameOver[0] && room.gameOver[1]) endRoom(room);
+    }
+
+    // ── rematch: oyun bitti, tekrar oyna ────────────────────────
+    else if (data.type === 'rematch') {
+      const roomId = ws._roomId;
+      if (roomId === null) return;
+      const room = rooms.get(roomId);
+      if (!room || !room.ended) return;
+
+      const idx = ws._playerIdx;
+      room.rematch[idx] = true;
+
+      const opp = room.players[1 - idx];
+      if (opp) wsSend(opp.ws, { type: 'rematchRequest' });
+
+      if (room.rematch[0] && room.rematch[1]) {
+        // İkisi de kabul etti — odayı sıfırla ve yeni oyun başlat
+        room.ended    = false;
+        room.scores   = [0, 0];
+        room.gameOver = [false, false];
+        room.rematch  = [false, false];
+        room.timeLeft = 90;
+        startRoomGame(room);
+      }
     }
 
     // ── ping ─────────────────────────────────────────────────────
