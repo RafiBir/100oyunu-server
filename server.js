@@ -72,9 +72,17 @@ app.delete('/api/scores', async (req, res) => {
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server });
 
-const queue = [];        // { ws, nickname }
-const rooms = new Map(); // id → room
-let   nextRoomId = 1;
+const queue        = [];        // { ws, nickname }
+const rooms        = new Map(); // id → room
+const privateRooms = new Map(); // code → { ws, nickname, rank, timeout }
+let   nextRoomId   = 1;
+
+function genCode() {
+  let code;
+  do { code = Math.random().toString(36).slice(2, 8).toUpperCase(); }
+  while (privateRooms.has(code));
+  return code;
+}
 
 function wsSend(ws, data) {
   if (ws.readyState === WebSocket.OPEN) {
@@ -157,8 +165,37 @@ wss.on('connection', (ws) => {
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
+    // ── createPrivate: create a private room with invite code ───
+    if (data.type === 'createPrivate') {
+      const nickname = String(data.nickname || 'Player').trim().slice(0, 20) || 'Player';
+      const rank = (data.rank && typeof data.rank.name === 'string') ? { icon: String(data.rank.icon || '').slice(0, 8), name: String(data.rank.name).slice(0, 20) } : null;
+      ws._nickname = nickname;
+      ws._rank = rank;
+      const code = genCode();
+      const timeout = setTimeout(() => privateRooms.delete(code), 5 * 60 * 1000);
+      privateRooms.set(code, { ws, nickname, rank, timeout });
+      wsSend(ws, { type: 'privateCreated', code });
+    }
+
+    // ── joinPrivate: join a private room by code ─────────────────
+    else if (data.type === 'joinPrivate') {
+      const code = String(data.code || '').toUpperCase().trim();
+      const host = privateRooms.get(code);
+      if (!host || host.ws.readyState !== WebSocket.OPEN) {
+        wsSend(ws, { type: 'privateNotFound' });
+        return;
+      }
+      const nickname = String(data.nickname || 'Player').trim().slice(0, 20) || 'Player';
+      const rank = (data.rank && typeof data.rank.name === 'string') ? { icon: String(data.rank.icon || '').slice(0, 8), name: String(data.rank.name).slice(0, 20) } : null;
+      ws._nickname = nickname;
+      ws._rank = rank;
+      clearTimeout(host.timeout);
+      privateRooms.delete(code);
+      createRoom({ ws, nickname, rank }, { ws: host.ws, nickname: host.nickname, rank: host.rank });
+    }
+
     // ── join: enter matchmaking queue ───────────────────────────
-    if (data.type === 'join') {
+    else if (data.type === 'join') {
       const nickname = String(data.nickname || 'Player').trim().slice(0, 20) || 'Player';
       const rank = (data.rank && typeof data.rank.name === 'string') ? { icon: String(data.rank.icon || '').slice(0, 8), name: String(data.rank.name).slice(0, 20) } : null;
       ws._nickname = nickname;
@@ -243,6 +280,19 @@ wss.on('connection', (ws) => {
       }
     }
 
+    // ── emoji reaction ───────────────────────────────────────────
+    else if (data.type === 'emoji') {
+      const ALLOWED_EMOJIS = ['👍','🔥','😅','😎','🤝','💪','😂','🎉'];
+      const roomId = ws._roomId;
+      if (roomId === null) return;
+      const room = rooms.get(roomId);
+      if (!room) return;
+      if (!ALLOWED_EMOJIS.includes(data.emoji)) return;
+      const idx = ws._playerIdx;
+      const opp = room.players[1 - idx];
+      if (opp) wsSend(opp.ws, { type: 'opponentEmoji', emoji: data.emoji });
+    }
+
     // ── ping ─────────────────────────────────────────────────────
     else if (data.type === 'ping') {
       wsSend(ws, { type: 'pong' });
@@ -250,6 +300,11 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    // Remove from private room if waiting for a joiner
+    for (const [code, entry] of privateRooms) {
+      if (entry.ws === ws) { clearTimeout(entry.timeout); privateRooms.delete(code); break; }
+    }
+
     // Remove from queue if still waiting
     const qi = queue.findIndex(p => p.ws === ws);
     if (qi !== -1) { queue.splice(qi, 1); return; }
