@@ -201,9 +201,10 @@ wss.on('connection', (ws) => {
       const rank = (data.rank && typeof data.rank.name === 'string') ? { icon: String(data.rank.icon || '').slice(0, 8), name: String(data.rank.name).slice(0, 20) } : null;
       ws._nickname = nickname;
       ws._rank = rank;
+      const mode = data.mode === 'coop' ? 'coop' : 'race';
       const code = genCode();
       const timeout = setTimeout(() => privateRooms.delete(code), 5 * 60 * 1000);
-      privateRooms.set(code, { ws, nickname, rank, timeout });
+      privateRooms.set(code, { ws, nickname, rank, timeout, mode });
       wsSend(ws, { type: 'privateCreated', code });
     }
 
@@ -221,7 +222,11 @@ wss.on('connection', (ws) => {
       ws._rank = rank;
       clearTimeout(host.timeout);
       privateRooms.delete(code);
-      createRoom({ ws, nickname, rank }, { ws: host.ws, nickname: host.nickname, rank: host.rank });
+      if (host.mode === 'coop') {
+        createCoopRoom({ ws, nickname, rank }, { ws: host.ws, nickname: host.nickname, rank: host.rank });
+      } else {
+        createRoom({ ws, nickname, rank }, { ws: host.ws, nickname: host.nickname, rank: host.rank });
+      }
     }
 
     // ── join: enter matchmaking queue ───────────────────────────
