@@ -120,8 +120,8 @@ function createRoom(p1, p2) {
 function startRoomGame(room) {
   const [p1, p2] = room.players;
 
-  wsSend(p1.ws, { type: 'matched', opponentNickname: p2.nickname });
-  wsSend(p2.ws, { type: 'matched', opponentNickname: p1.nickname });
+  wsSend(p1.ws, { type: 'matched', opponentNickname: p2.nickname, opponentRank: p2.rank || null });
+  wsSend(p2.ws, { type: 'matched', opponentNickname: p1.nickname, opponentRank: p1.rank || null });
 
   setTimeout(() => {
     if (!rooms.has(room.id)) return;
@@ -154,7 +154,9 @@ wss.on('connection', (ws) => {
     // ── join: enter matchmaking queue ───────────────────────────
     if (data.type === 'join') {
       const nickname = String(data.nickname || 'Player').trim().slice(0, 20) || 'Player';
+      const rank = (data.rank && typeof data.rank.name === 'string') ? { icon: String(data.rank.icon || '').slice(0, 8), name: String(data.rank.name).slice(0, 20) } : null;
       ws._nickname = nickname;
+      ws._rank = rank;
 
       // Clean stale entries from queue
       for (let i = queue.length - 1; i >= 0; i--) {
@@ -163,10 +165,10 @@ wss.on('connection', (ws) => {
 
       if (queue.length > 0) {
         const opponent = queue.shift();
-        createRoom({ ws, nickname }, opponent);
+        createRoom({ ws, nickname, rank }, opponent);
       } else {
         wsSend(ws, { type: 'waiting' });
-        queue.push({ ws, nickname });
+        queue.push({ ws, nickname, rank });
       }
     }
 
