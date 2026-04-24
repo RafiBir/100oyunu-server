@@ -22,43 +22,49 @@ function escapeHtml(str) {
 }
 
 // GET /api/scores?limit=20&mode=serbest
-app.get('/api/scores', (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 20, 100);
-  const mode  = VALID_MODES.includes(req.query.mode) ? req.query.mode : 'serbest';
-  res.json(getTopScores(limit, mode));
+app.get('/api/scores', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const mode  = VALID_MODES.includes(req.query.mode) ? req.query.mode : 'serbest';
+    res.json(await getTopScores(limit, mode));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // POST /api/scores  { nickname, score, mode }
-app.post('/api/scores', (req, res) => {
-  let { nickname, score, mode } = req.body;
+app.post('/api/scores', async (req, res) => {
+  try {
+    let { nickname, score, mode } = req.body;
 
-  if (typeof nickname !== 'string' || nickname.trim().length === 0) {
-    return res.status(400).json({ error: 'Geçerli bir nickname gir.' });
-  }
-  nickname = escapeHtml(nickname.trim()).slice(0, 20);
+    if (typeof nickname !== 'string' || nickname.trim().length === 0) {
+      return res.status(400).json({ error: 'Geçerli bir nickname gir.' });
+    }
+    nickname = escapeHtml(nickname.trim()).slice(0, 20);
 
-  score = parseInt(score);
-  if (isNaN(score) || score < 1 || score > 100) {
-    return res.status(400).json({ error: 'Skor 1-100 arasında olmalı.' });
-  }
+    score = parseInt(score);
+    if (isNaN(score) || score < 1 || score > 100) {
+      return res.status(400).json({ error: 'Skor 1-100 arasında olmalı.' });
+    }
 
-  if (!VALID_MODES.includes(mode)) mode = 'serbest';
+    if (!VALID_MODES.includes(mode)) mode = 'serbest';
 
-  const date = new Date().toLocaleDateString('tr-TR', {
-    day: '2-digit', month: '2-digit', year: '2-digit'
-  });
+    const date = new Date().toLocaleDateString('tr-TR', {
+      day: '2-digit', month: '2-digit', year: '2-digit'
+    });
 
-  insertScore(nickname, score, date, mode);
-  const { rank, total } = getRank(score, mode);
-  res.json({ rank, total });
+    await insertScore(nickname, score, date, mode);
+    const { rank, total } = await getRank(score, mode);
+    res.json({ rank, total });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // DELETE /api/scores?key=ADMIN_KEY&mode=serbest
-app.delete('/api/scores', (req, res) => {
-  if (req.query.key !== ADMIN_KEY) return res.status(403).json({ error: 'Yetkisiz.' });
-  const mode = VALID_MODES.includes(req.query.mode) ? req.query.mode : null;
-  clearScores(mode);
-  res.json({ ok: true });
+app.delete('/api/scores', async (req, res) => {
+  try {
+    if (req.query.key !== ADMIN_KEY) return res.status(403).json({ error: 'Yetkisiz.' });
+    const mode = VALID_MODES.includes(req.query.mode) ? req.query.mode : null;
+    await clearScores(mode);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── WebSocket Matchmaking ────────────────────────────────────────────────────
