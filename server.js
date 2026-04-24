@@ -73,6 +73,7 @@ const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server });
 
 const queue        = [];        // { ws, nickname }
+const coopQueue    = [];        // { ws, nickname, rank }
 const rooms        = new Map(); // id → room
 const privateRooms = new Map(); // code → { ws, nickname, rank, timeout }
 let   nextRoomId   = 1;
@@ -108,6 +109,35 @@ function endRoom(room) {
   room.rematch = [false, false];
   room.timerInterval = null;
   room._deleteTimeout = setTimeout(() => rooms.delete(room.id), 30000);
+}
+
+function createCoopRoom(p1, p2) {
+  const id = nextRoomId++;
+  const room = {
+    id,
+    type: 'coop',
+    players: [p1, p2],
+    coopCurrentNumber: 1,
+    coopGameOver: false,
+    timerInterval: null,
+  };
+  p1.ws._roomId = id; p1.ws._playerIdx = 0;
+  p2.ws._roomId = id; p2.ws._playerIdx = 1;
+  rooms.set(id, room);
+
+  // player 0 = odd (1,3,5...), player 1 = even (2,4,6...)
+  setTimeout(() => {
+    if (!rooms.has(id)) return;
+    wsSend(p1.ws, { type: 'coopMatched', opponentNickname: p2.nickname, opponentRank: p2.rank || null, yourRole: 'odd' });
+    wsSend(p2.ws, { type: 'coopMatched', opponentNickname: p1.nickname, opponentRank: p1.rank || null, yourRole: 'even' });
+  }, 500);
+
+  setTimeout(() => {
+    if (!rooms.has(id)) return;
+    wsSend(p1.ws, { type: 'coopStart' });
+    wsSend(p2.ws, { type: 'coopStart' });
+    wsSend(p1.ws, { type: 'coopYourTurn', n: 1 });
+  }, 2000);
 }
 
 function createRoom(p1, p2) {
@@ -293,6 +323,78 @@ wss.on('connection', (ws) => {
       if (opp) wsSend(opp.ws, { type: 'opponentEmoji', emoji: data.emoji });
     }
 
+    // ── coopJoin: enter cooperative matchmaking ─────────────────
+    else if (data.type === 'coopJoin') {
+      const nickname = String(data.nickname || 'Player').trim().slice(0, 20) || 'Player';
+      const rank = (data.rank && typeof data.rank.name === 'string') ? { icon: String(data.rank.icon || '').slice(0, 8), name: String(data.rank.name).slice(0, 20) } : null;
+      ws._nickname = nickname;
+      ws._rank = rank;
+
+      for (let i = coopQueue.length - 1; i >= 0; i--) {
+        if (coopQueue[i].ws.readyState !== WebSocket.OPEN) coopQueue.splice(i, 1);
+      }
+
+      if (coopQueue.length > 0) {
+        const partner = coopQueue.shift();
+        createCoopRoom({ ws, nickname, rank }, partner);
+      } else {
+        wsSend(ws, { type: 'coopWaiting' });
+        coopQueue.push({ ws, nickname, rank });
+      }
+    }
+
+    // ── coopMove: player placed a cooperative number ─────────────
+    else if (data.type === 'coopMove') {
+      const roomId = ws._roomId;
+      if (roomId === null) return;
+      const room = rooms.get(roomId);
+      if (!room || room.type !== 'coop' || room.coopGameOver) return;
+
+      const idx = ws._playerIdx;
+      const r = parseInt(data.r);
+      const c = parseInt(data.c);
+      const n = parseInt(data.n);
+
+      if (isNaN(r) || isNaN(c) || isNaN(n)) return;
+      if (r < 0 || r > 9 || c < 0 || c > 9) return;
+      if (n !== room.coopCurrentNumber) return;
+
+      // odd numbers (1,3,5...) belong to player 0; even to player 1
+      const expectedIdx = (n % 2 === 1) ? 0 : 1;
+      if (idx !== expectedIdx) return;
+
+      const opp = room.players[1 - idx];
+      if (opp) wsSend(opp.ws, { type: 'coopOpponentMove', r, c, n });
+
+      room.coopCurrentNumber++;
+
+      if (n === 100) {
+        room.coopGameOver = true;
+        wsSend(ws, { type: 'coopResult', outcome: 'complete', score: 100 });
+        if (opp) wsSend(opp.ws, { type: 'coopResult', outcome: 'complete', score: 100 });
+        rooms.delete(room.id);
+        return;
+      }
+
+      const nextN = room.coopCurrentNumber;
+      if (opp) wsSend(opp.ws, { type: 'coopYourTurn', n: nextN });
+    }
+
+    // ── coopStuck: a player has no valid coop moves ───────────────
+    else if (data.type === 'coopStuck') {
+      const roomId = ws._roomId;
+      if (roomId === null) return;
+      const room = rooms.get(roomId);
+      if (!room || room.type !== 'coop' || room.coopGameOver) return;
+
+      room.coopGameOver = true;
+      const score = room.coopCurrentNumber - 1;
+      room.players.forEach(p => {
+        if (p) wsSend(p.ws, { type: 'coopResult', outcome: 'stuck', score });
+      });
+      rooms.delete(room.id);
+    }
+
     // ── ping ─────────────────────────────────────────────────────
     else if (data.type === 'ping') {
       wsSend(ws, { type: 'pong' });
@@ -308,6 +410,10 @@ wss.on('connection', (ws) => {
     // Remove from queue if still waiting
     const qi = queue.findIndex(p => p.ws === ws);
     if (qi !== -1) { queue.splice(qi, 1); return; }
+
+    // Remove from coop queue if waiting
+    const cqi = coopQueue.findIndex(p => p.ws === ws);
+    if (cqi !== -1) { coopQueue.splice(cqi, 1); return; }
 
     // Notify opponent if mid-game
     const roomId = ws._roomId;
