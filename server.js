@@ -761,9 +761,21 @@ wss.on('connection', (ws) => {
       if (room) {
         if (room.type === 'block') {
           const idx = ws._playerIdx;
-          const alive = blockAliveIndexes(room).filter(i => i !== idx);
-          if (alive.length === 1) endBlockRoom(room, alive[0], 'disconnect');
-          else rooms.delete(roomId);
+          if (idx === null || idx === undefined || !room.alive[idx]) return;
+          room.alive[idx] = false;
+          room.players[idx].ws._roomId = null;
+          room.players[idx].ws._playerIdx = null;
+          const alive = blockAliveIndexes(room);
+          if (alive.length <= 1) {
+            endBlockRoom(room, alive[0] ?? idx, 'disconnect');
+            return;
+          }
+          if (room.turnIndex === idx) {
+            advanceBlockTurn(room, [idx]);
+          } else {
+            blockBroadcast(room, { type: 'blockEliminated', playerIndex: idx, ...blockPayload(room) });
+            blockBroadcast(room, { type: 'blockTurn', ...blockPayload(room) });
+          }
         } else if (room.type === 'coop4') {
           const idx = ws._playerIdx;
           const wasCurrentTurn = room.turnIdx === idx;
