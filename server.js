@@ -84,6 +84,7 @@ const wss    = new WebSocket.Server({ server });
 
 const queue        = [];        // { ws, nickname }
 const coopQueue    = [];        // { ws, nickname, rank }
+const coopQueue4   = [];        // { ws, nickname, rank }
 const sabotajQueue = [];        // { ws, nickname, rank }
 const blockQueues  = new Map(); // playerCount -> [{ ws, nickname, rank }]
 const rooms        = new Map(); // id → room
@@ -150,6 +151,30 @@ function createCoopRoom(p1, p2) {
     wsSend(p2.ws, { type: 'coopStart' });
     wsSend(p1.ws, { type: 'coopYourTurn', n: 1 });
   }, 2000);
+}
+
+function createCoop4Room(players) {
+  const id = nextRoomId++;
+  const room = {
+    id, type: 'coop4', players,
+    currentNumber: 1, lastR: -1, lastC: -1,
+    turnIdx: 0,
+    activePlayers: players.map((_, i) => i),
+    gameOver: false,
+  };
+  players.forEach((p, i) => { p.ws._roomId = id; p.ws._playerIdx = i; });
+  rooms.set(id, room);
+
+  players.forEach((p, i) => wsSend(p.ws, {
+    type: 'coop4Matched', playerIdx: i,
+    players: players.map(pl => ({ nickname: pl.nickname, rank: pl.rank || null })),
+  }));
+
+  setTimeout(() => {
+    if (!rooms.has(id)) return;
+    players.forEach(p => wsSend(p.ws, { type: 'coop4Start' }));
+    players.forEach(p => wsSend(p.ws, { type: 'coop4Turn', turnIdx: 0, n: 1 }));
+  }, 1500);
 }
 
 function createRoom(p1, p2) {
@@ -593,6 +618,57 @@ wss.on('connection', (ws) => {
       rooms.delete(room.id);
     }
 
+    // ── coop4Join: 4-player coop matchmaking ────────────────────
+    else if (data.type === 'coop4Join') {
+      const nickname = String(data.nickname || 'Player').trim().slice(0, 20) || 'Player';
+      const rank = (data.rank && typeof data.rank.name === 'string') ? { icon: String(data.rank.icon || '').slice(0, 8), name: String(data.rank.name).slice(0, 20) } : null;
+      ws._nickname = nickname; ws._rank = rank;
+      for (let i = coopQueue4.length - 1; i >= 0; i--) if (coopQueue4[i].ws.readyState !== WebSocket.OPEN) coopQueue4.splice(i, 1);
+      coopQueue4.push({ ws, nickname, rank });
+      wsSend(ws, { type: 'coop4Waiting', position: coopQueue4.length });
+      if (coopQueue4.length >= 4) {
+        const players = coopQueue4.splice(0, 4);
+        createCoop4Room(players);
+      }
+    }
+
+    // ── coop4Move: player placed a number ───────────────────────
+    else if (data.type === 'coop4Move') {
+      const roomId = ws._roomId;
+      if (roomId === null) return;
+      const room = rooms.get(roomId);
+      if (!room || room.type !== 'coop4' || room.gameOver) return;
+      const idx = ws._playerIdx;
+      if (idx !== room.turnIdx || !room.activePlayers.includes(idx)) return;
+      const r = parseInt(data.r), c = parseInt(data.c), n = parseInt(data.n);
+      if (isNaN(r) || isNaN(c) || isNaN(n) || r < 0 || r > 9 || c < 0 || c > 9) return;
+      if (n !== room.currentNumber) return;
+      room.currentNumber++;
+      room.lastR = r; room.lastC = c;
+      room.players.forEach(p => { if (p) wsSend(p.ws, { type: 'coop4Move', playerIdx: idx, r, c, n }); });
+      if (n === 100) {
+        room.gameOver = true;
+        room.players.forEach(p => { if (p) wsSend(p.ws, { type: 'coop4Result', outcome: 'complete', score: 100 }); });
+        rooms.delete(room.id); return;
+      }
+      const pos = room.activePlayers.indexOf(room.turnIdx);
+      room.turnIdx = room.activePlayers[(pos + 1) % room.activePlayers.length];
+      room.players.forEach(p => { if (p) wsSend(p.ws, { type: 'coop4Turn', turnIdx: room.turnIdx, n: room.currentNumber }); });
+    }
+
+    // ── coop4Stuck: current player has no valid moves ────────────
+    else if (data.type === 'coop4Stuck') {
+      const roomId = ws._roomId;
+      if (roomId === null) return;
+      const room = rooms.get(roomId);
+      if (!room || room.type !== 'coop4' || room.gameOver) return;
+      if (ws._playerIdx !== room.turnIdx) return;
+      room.gameOver = true;
+      const score = room.currentNumber - 1;
+      room.players.forEach(p => { if (p) wsSend(p.ws, { type: 'coop4Result', outcome: 'stuck', score }); });
+      rooms.delete(room.id);
+    }
+
     // ── ping ─────────────────────────────────────────────────────
     else if (data.type === 'ping') {
       wsSend(ws, { type: 'pong' });
@@ -627,6 +703,10 @@ wss.on('connection', (ws) => {
     const cqi = coopQueue.findIndex(p => p.ws === ws);
     if (cqi !== -1) { coopQueue.splice(cqi, 1); return; }
 
+    // Remove from coop4 queue if waiting
+    const c4qi = coopQueue4.findIndex(p => p.ws === ws);
+    if (c4qi !== -1) { coopQueue4.splice(c4qi, 1); return; }
+
     for (const blockQueue of blockQueues.values()) {
       const bqi = blockQueue.findIndex(p => p.ws === ws);
       if (bqi !== -1) { blockQueue.splice(bqi, 1); return; }
@@ -642,6 +722,29 @@ wss.on('connection', (ws) => {
           const alive = blockAliveIndexes(room).filter(i => i !== idx);
           if (alive.length === 1) endBlockRoom(room, alive[0], 'disconnect');
           else rooms.delete(roomId);
+        } else if (room.type === 'coop4') {
+          const idx = ws._playerIdx;
+          const wasCurrentTurn = room.turnIdx === idx;
+          const oldPos = room.activePlayers.indexOf(idx);
+          room.players[idx] = null;
+          room.activePlayers = room.activePlayers.filter(i => i !== idx);
+          room.players.forEach(p => { if (p) wsSend(p.ws, { type: 'coop4PlayerLeft', playerIdx: idx }); });
+          if (room.activePlayers.length <= 1) {
+            room.gameOver = true;
+            room.activePlayers.forEach(i => {
+              if (room.players[i]) {
+                wsSend(room.players[i].ws, { type: 'coop4Result', outcome: 'disconnect', score: room.currentNumber - 1 });
+                room.players[i].ws._roomId = null;
+              }
+            });
+            rooms.delete(room.id); return;
+          }
+          if (wasCurrentTurn) {
+            const nextPos = room.activePlayers.length > 0 ? (oldPos % room.activePlayers.length) : 0;
+            room.turnIdx = room.activePlayers[nextPos];
+            room.players.forEach(p => { if (p) wsSend(p.ws, { type: 'coop4Turn', turnIdx: room.turnIdx, n: room.currentNumber }); });
+          }
+          return;
         } else {
           clearInterval(room.timerInterval);
           room.players.forEach(p => {
