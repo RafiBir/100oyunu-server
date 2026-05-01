@@ -252,15 +252,24 @@ function endBlockRoom(room, winnerIdx, reason = 'lastStanding') {
   rooms.delete(room.id);
 }
 
-function advanceBlockTurn(room) {
+function advanceBlockTurn(room, eliminatedNow = []) {
   const alive = blockAliveIndexes(room);
   if (alive.length <= 1) { endBlockRoom(room, alive[0] ?? 0); return; }
+
+  const eliminated = [...eliminatedNow];
   for (let step = 1; step <= room.players.length; step++) {
     const idx = (room.turnIndex + step) % room.players.length;
     if (!room.alive[idx]) continue;
-    if (blockHasMove(room, idx)) { room.turnIndex = idx; blockBroadcast(room, { type: 'blockTurn', ...blockPayload(room) }); return; }
+
+    if (blockHasMove(room, idx)) {
+      room.turnIndex = idx;
+      eliminated.forEach(playerIndex => blockBroadcast(room, { type: 'blockEliminated', playerIndex, ...blockPayload(room) }));
+      blockBroadcast(room, { type: 'blockTurn', ...blockPayload(room) });
+      return;
+    }
+
     room.alive[idx] = false;
-    blockBroadcast(room, { type: 'blockEliminated', playerIndex: idx, ...blockPayload(room) });
+    eliminated.push(idx);
     const stillAlive = blockAliveIndexes(room);
     if (stillAlive.length <= 1) { endBlockRoom(room, stillAlive[0] ?? idx); return; }
   }
@@ -507,10 +516,9 @@ wss.on('connection', (ws) => {
       const idx = ws._playerIdx;
       if (!room.alive[idx] || blockHasMove(room, idx)) return;
       room.alive[idx] = false;
-      blockBroadcast(room, { type: 'blockEliminated', playerIndex: idx, ...blockPayload(room) });
       const alive = blockAliveIndexes(room);
       if (alive.length <= 1) endBlockRoom(room, alive[0] ?? idx);
-      else advanceBlockTurn(room);
+      else advanceBlockTurn(room, [idx]);
     }
 
     // ── coopJoin: enter cooperative matchmaking ─────────────────
