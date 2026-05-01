@@ -160,7 +160,7 @@ function createRoom(p1, p2) {
     scores:  [0, 0],
     gameOver:[false, false],
     timerInterval: null,
-    timeLeft: 90,
+    timeLeft: 45,
   };
 
   p1.ws._roomId      = id;
@@ -453,7 +453,7 @@ wss.on('connection', (ws) => {
         room.scores   = [0, 0];
         room.gameOver = [false, false];
         room.rematch  = [false, false];
-        room.timeLeft = 90;
+        room.timeLeft = 45;
         startRoomGame(room);
       }
     }
