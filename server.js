@@ -253,6 +253,23 @@ function getBlockQueue(playerCount) {
   return blockQueues.get(count);
 }
 
+function notifyBlockQueue(blockQueue, playerCount) {
+  blockQueue.forEach(p => wsSend(p.ws, {
+    type: 'blockWaiting',
+    joined: blockQueue.length,
+    playerCount,
+  }));
+}
+
+function notifyCoop4Queue() {
+  coopQueue4.forEach(p => wsSend(p.ws, {
+    type: 'coop4Waiting',
+    position: coopQueue4.length,
+    joined: coopQueue4.length,
+    playerCount: 4,
+  }));
+}
+
 function blockPayload(room) {
   return {
     players: room.players.map((p, i) => ({ nickname: p.nickname, rank: p.rank || null, alive: room.alive[i], score: room.scores[i] })),
@@ -518,11 +535,17 @@ wss.on('connection', (ws) => {
       const playerCount = getBlockPlayerCount(data.playerCount);
       const blockQueue = getBlockQueue(playerCount);
       for (let i = blockQueue.length - 1; i >= 0; i--) if (blockQueue[i].ws.readyState !== WebSocket.OPEN) blockQueue.splice(i, 1);
+      const alreadyQueued = blockQueue.find(p => p.ws === ws);
+      if (alreadyQueued) {
+        notifyBlockQueue(blockQueue, playerCount);
+        return;
+      }
       blockQueue.push({ ws, nickname, rank });
-      wsSend(ws, { type: 'blockWaiting', joined: blockQueue.length, playerCount });
+      notifyBlockQueue(blockQueue, playerCount);
       if (blockQueue.length >= playerCount) {
         const players = blockQueue.splice(0, playerCount);
         createBlockRoom(players);
+        notifyBlockQueue(blockQueue, playerCount);
       }
     }
 
@@ -637,11 +660,16 @@ wss.on('connection', (ws) => {
       const rank = (data.rank && typeof data.rank.name === 'string') ? { icon: String(data.rank.icon || '').slice(0, 8), name: String(data.rank.name).slice(0, 20) } : null;
       ws._nickname = nickname; ws._rank = rank;
       for (let i = coopQueue4.length - 1; i >= 0; i--) if (coopQueue4[i].ws.readyState !== WebSocket.OPEN) coopQueue4.splice(i, 1);
+      if (coopQueue4.some(p => p.ws === ws)) {
+        notifyCoop4Queue();
+        return;
+      }
       coopQueue4.push({ ws, nickname, rank });
-      wsSend(ws, { type: 'coop4Waiting', position: coopQueue4.length });
+      notifyCoop4Queue();
       if (coopQueue4.length >= 4) {
         const players = coopQueue4.splice(0, 4);
         createCoop4Room(players);
+        notifyCoop4Queue();
       }
     }
 
@@ -692,13 +720,14 @@ wss.on('connection', (ws) => {
     // Remove from private room if waiting for a joiner
     for (const [code, entry] of privateRooms) {
       if (entry.ws === ws || entry.players?.some(p => p.ws === ws)) {
-        if (entry.mode === 'block' && entry.players) {
+        if ((entry.mode === 'block' || entry.mode === 'coop') && entry.players) {
           entry.players = entry.players.filter(p => p.ws !== ws && p.ws.readyState === WebSocket.OPEN);
           if (entry.players.length) {
             entry.ws = entry.players[0].ws;
             entry.nickname = entry.players[0].nickname;
             entry.rank = entry.players[0].rank;
-            entry.players.forEach((p, i) => wsSend(p.ws, { type: 'blockPrivateWaiting', code, joined: entry.players.length, playerCount: entry.playerCount, yourIndex: i }));
+            const type = entry.mode === 'block' ? 'blockPrivateWaiting' : 'coopPrivateWaiting';
+            entry.players.forEach((p, i) => wsSend(p.ws, { type, code, joined: entry.players.length, playerCount: entry.playerCount, yourIndex: i, playerIdx: i }));
             continue;
           }
         }
@@ -718,11 +747,11 @@ wss.on('connection', (ws) => {
 
     // Remove from coop4 queue if waiting
     const c4qi = coopQueue4.findIndex(p => p.ws === ws);
-    if (c4qi !== -1) { coopQueue4.splice(c4qi, 1); return; }
+    if (c4qi !== -1) { coopQueue4.splice(c4qi, 1); notifyCoop4Queue(); return; }
 
-    for (const blockQueue of blockQueues.values()) {
+    for (const [playerCount, blockQueue] of blockQueues) {
       const bqi = blockQueue.findIndex(p => p.ws === ws);
-      if (bqi !== -1) { blockQueue.splice(bqi, 1); return; }
+      if (bqi !== -1) { blockQueue.splice(bqi, 1); notifyBlockQueue(blockQueue, playerCount); return; }
     }
 
     // Notify opponent if mid-game
