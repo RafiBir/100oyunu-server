@@ -358,10 +358,13 @@ wss.on('connection', (ws) => {
       if (mode === 'block') {
         const playerCount = getBlockPlayerCount(data.playerCount);
         privateRooms.set(code, { ws, nickname, rank, timeout, mode, playerCount, players: [{ ws, nickname, rank }] });
+      } else if (mode === 'coop') {
+        const playerCount = Number(data.playerCount) === 4 ? 4 : 2;
+        privateRooms.set(code, { ws, nickname, rank, timeout, mode, playerCount, players: [{ ws, nickname, rank }] });
       } else {
         privateRooms.set(code, { ws, nickname, rank, timeout, mode });
       }
-      wsSend(ws, { type: 'privateCreated', code });
+      wsSend(ws, { type: 'privateCreated', code, playerCount: privateRooms.get(code)?.playerCount || 2, joined: 1 });
     }
 
     // ── joinPrivate: join a private room by code ─────────────────
@@ -385,6 +388,16 @@ wss.on('connection', (ws) => {
           clearTimeout(host.timeout);
           privateRooms.delete(code);
           createBlockRoom(host.players.slice(0, host.playerCount));
+        }
+      } else if (host.mode === 'coop' && host.playerCount === 4) {
+        host.players = (host.players || [{ ws: host.ws, nickname: host.nickname, rank: host.rank }]).filter(p => p.ws.readyState === WebSocket.OPEN);
+        if (host.players.some(p => p.ws === ws)) return;
+        host.players.push({ ws, nickname, rank });
+        host.players.forEach((p, i) => wsSend(p.ws, { type: 'coopPrivateWaiting', code, joined: host.players.length, playerCount: host.playerCount, playerIdx: i }));
+        if (host.players.length >= host.playerCount) {
+          clearTimeout(host.timeout);
+          privateRooms.delete(code);
+          createCoop4Room(host.players.slice(0, host.playerCount));
         }
       } else {
         clearTimeout(host.timeout);
