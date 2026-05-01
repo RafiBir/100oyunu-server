@@ -282,9 +282,24 @@ function blockBroadcast(room, data) {
   room.players.forEach(p => { if (p) wsSend(p.ws, data); });
 }
 
+function startBlockTurnTimer(room) {
+  if (room.turnTimer) clearTimeout(room.turnTimer);
+  room.turnTimer = setTimeout(() => {
+    if (room.ended) return;
+    const idx = room.turnIndex;
+    if (!room.alive[idx]) return;
+    room.alive[idx] = false;
+    room.turnTimer = null;
+    const alive = blockAliveIndexes(room);
+    if (alive.length <= 1) endBlockRoom(room, alive[0] ?? idx, 'timeout');
+    else advanceBlockTurn(room, [idx]);
+  }, 20000);
+}
+
 function endBlockRoom(room, winnerIdx, reason = 'lastStanding') {
   if (room.ended) return;
   room.ended = true;
+  if (room.turnTimer) { clearTimeout(room.turnTimer); room.turnTimer = null; }
   room.players.forEach((p, i) => {
     if (!p) return;
     wsSend(p.ws, { type: 'blockResult', winner: i === winnerIdx ? 'you' : 'opponent', winnerIndex: winnerIdx, winnerName: room.players[winnerIdx]?.nickname || 'Player', reason, players: blockPayload(room).players, board: room.board });
@@ -307,6 +322,7 @@ function advanceBlockTurn(room, eliminatedNow = []) {
       room.turnIndex = idx;
       eliminated.forEach(playerIndex => blockBroadcast(room, { type: 'blockEliminated', playerIndex, ...blockPayload(room) }));
       blockBroadcast(room, { type: 'blockTurn', ...blockPayload(room) });
+      startBlockTurnTimer(room);
       return;
     }
 
@@ -331,6 +347,7 @@ function createBlockRoom(players) {
     turnIndex: 0,
     ended: false,
     playerCount: count,
+    turnTimer: null,
   };
 
   players.forEach((p, i) => {
@@ -351,6 +368,7 @@ function createBlockRoom(players) {
   setTimeout(() => {
     if (!rooms.has(id)) return;
     players.forEach((p, i) => wsSend(p.ws, { type: 'blockStart', yourIndex: i, playerCount: count, ...blockPayload(room) }));
+    startBlockTurnTimer(room);
   }, 1200);
 }
 
@@ -564,6 +582,7 @@ wss.on('connection', (ws) => {
       room.last[idx] = { r, c };
       room.scores[idx]++;
       room.numbers[idx]++;
+      if (room.turnTimer) { clearTimeout(room.turnTimer); room.turnTimer = null; }
       blockBroadcast(room, { type: 'blockMove', playerIndex: idx, r, c, n, ...blockPayload(room) });
       advanceBlockTurn(room);
     }
@@ -576,9 +595,25 @@ wss.on('connection', (ws) => {
       if (!room || room.type !== 'block' || room.ended) return;
       const idx = ws._playerIdx;
       if (!room.alive[idx] || blockHasMove(room, idx)) return;
+      if (room.turnTimer) { clearTimeout(room.turnTimer); room.turnTimer = null; }
       room.alive[idx] = false;
       const alive = blockAliveIndexes(room);
       if (alive.length <= 1) endBlockRoom(room, alive[0] ?? idx);
+      else advanceBlockTurn(room, [idx]);
+    }
+
+    // -- blockTimeout: client's 20s countdown hit 0, they forfeit --
+    else if (data.type === 'blockTimeout') {
+      const roomId = ws._roomId;
+      if (roomId === null) return;
+      const room = rooms.get(roomId);
+      if (!room || room.type !== 'block' || room.ended) return;
+      const idx = ws._playerIdx;
+      if (!room.alive[idx]) return;
+      if (room.turnTimer) { clearTimeout(room.turnTimer); room.turnTimer = null; }
+      room.alive[idx] = false;
+      const alive = blockAliveIndexes(room);
+      if (alive.length <= 1) endBlockRoom(room, alive[0] ?? idx, 'timeout');
       else advanceBlockTurn(room, [idx]);
     }
 
