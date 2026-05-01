@@ -7,10 +7,14 @@ const { insertScore, getTopScores, getRank, clearScores } = require('./db');
 const ADMIN_KEY   = process.env.ADMIN_KEY || 'gizli123';
 const VALID_MODES = ['serbest', 'surpriz'];
 
+const scoreRateLimit = new Map(); // ip -> lastSubmitMs
+
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors());
+app.use(cors({
+  origin: ['https://rafibir.github.io', 'http://localhost:3001']
+}));
 app.use(express.json());
 
 function escapeHtml(str) {
@@ -33,6 +37,12 @@ app.get('/api/scores', async (req, res) => {
 // POST /api/scores  { nickname, score, mode }
 app.post('/api/scores', async (req, res) => {
   try {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    const last = scoreRateLimit.get(ip) || 0;
+    if (now - last < 60_000) return res.status(429).json({ error: 'Çok sık istek. 1 dakika bekle.' });
+    scoreRateLimit.set(ip, now);
+
     let { nickname, score, mode } = req.body;
 
     if (typeof nickname !== 'string' || nickname.trim().length === 0) {
@@ -74,8 +84,10 @@ const wss    = new WebSocket.Server({ server });
 
 const queue        = [];        // { ws, nickname }
 const coopQueue    = [];        // { ws, nickname, rank }
+const sabotajQueue = [];        // { ws, nickname, rank }
+const blockQueue   = [];        // { ws, nickname, rank }
 const rooms        = new Map(); // id → room
-const privateRooms = new Map(); // code → { ws, nickname, rank, timeout }
+const privateRooms = new Map(); // code → { ws|players, nickname, rank, timeout, mode }
 let   nextRoomId   = 1;
 
 function genCode() {
@@ -186,6 +198,84 @@ function startRoomGame(room) {
   }, 1500);
 }
 
+function validBlockMove(room, idx, r, c) {
+  if (r < 0 || r >= room.size || c < 0 || c >= room.size) return false;
+  if (room.board[r][c]) return false;
+  const last = room.last[idx];
+  if (last.r === -1 || last.c === -1) return true;
+  const dr = Math.abs(r - last.r), dc = Math.abs(c - last.c);
+  return (dr === 0 && dc === 3) || (dc === 0 && dr === 3) || (dr === 2 && dc === 2);
+}
+
+function blockHasMove(room, idx) {
+  if (!room.alive[idx]) return false;
+  for (let r = 0; r < room.size; r++) for (let c = 0; c < room.size; c++) if (validBlockMove(room, idx, r, c)) return true;
+  return false;
+}
+
+function blockAliveIndexes(room) {
+  return room.alive.map((v, i) => v ? i : -1).filter(i => i !== -1);
+}
+
+function blockPayload(room) {
+  return {
+    players: room.players.map((p, i) => ({ nickname: p.nickname, rank: p.rank || null, alive: room.alive[i], score: room.scores[i] })),
+    turnIndex: room.turnIndex,
+    board: room.board,
+  };
+}
+
+function blockBroadcast(room, data) {
+  room.players.forEach(p => { if (p) wsSend(p.ws, data); });
+}
+
+function endBlockRoom(room, winnerIdx, reason = 'lastStanding') {
+  if (room.ended) return;
+  room.ended = true;
+  room.players.forEach((p, i) => {
+    if (!p) return;
+    wsSend(p.ws, { type: 'blockResult', winner: i === winnerIdx ? 'you' : 'opponent', winnerIndex: winnerIdx, winnerName: room.players[winnerIdx]?.nickname || 'Player', reason, players: blockPayload(room).players, board: room.board });
+    p.ws._roomId = null;
+    p.ws._playerIdx = null;
+  });
+  rooms.delete(room.id);
+}
+
+function advanceBlockTurn(room) {
+  const alive = blockAliveIndexes(room);
+  if (alive.length <= 1) { endBlockRoom(room, alive[0] ?? 0); return; }
+  for (let step = 1; step <= room.players.length; step++) {
+    const idx = (room.turnIndex + step) % room.players.length;
+    if (!room.alive[idx]) continue;
+    if (blockHasMove(room, idx)) { room.turnIndex = idx; blockBroadcast(room, { type: 'blockTurn', ...blockPayload(room) }); return; }
+    room.alive[idx] = false;
+    blockBroadcast(room, { type: 'blockEliminated', playerIndex: idx, ...blockPayload(room) });
+    const stillAlive = blockAliveIndexes(room);
+    if (stillAlive.length <= 1) { endBlockRoom(room, stillAlive[0] ?? idx); return; }
+  }
+}
+
+function createBlockRoom(p1, p2) {
+  const id = nextRoomId++;
+  const size = 10;
+  const room = {
+    id, type: 'block', size, players: [p1, p2],
+    board: Array.from({ length: size }, () => Array(size).fill(null)),
+    scores: [0, 0], numbers: [1, 1], last: [{ r: -1, c: -1 }, { r: -1, c: -1 }],
+    alive: [true, true], turnIndex: 0, ended: false,
+  };
+  p1.ws._roomId = id; p1.ws._playerIdx = 0;
+  p2.ws._roomId = id; p2.ws._playerIdx = 1;
+  rooms.set(id, room);
+  wsSend(p1.ws, { type: 'blockMatched', opponentNickname: p2.nickname, opponentRank: p2.rank || null });
+  wsSend(p2.ws, { type: 'blockMatched', opponentNickname: p1.nickname, opponentRank: p1.rank || null });
+  setTimeout(() => {
+    if (!rooms.has(id)) return;
+    wsSend(p1.ws, { type: 'blockStart', yourIndex: 0, ...blockPayload(room) });
+    wsSend(p2.ws, { type: 'blockStart', yourIndex: 1, ...blockPayload(room) });
+  }, 1200);
+}
+
 wss.on('connection', (ws) => {
   ws._roomId    = null;
   ws._playerIdx = null;
@@ -201,7 +291,7 @@ wss.on('connection', (ws) => {
       const rank = (data.rank && typeof data.rank.name === 'string') ? { icon: String(data.rank.icon || '').slice(0, 8), name: String(data.rank.name).slice(0, 20) } : null;
       ws._nickname = nickname;
       ws._rank = rank;
-      const mode = data.mode === 'coop' ? 'coop' : 'race';
+      const mode = data.mode === 'coop' ? 'coop' : data.mode === 'block' ? 'block' : 'race';
       const code = genCode();
       const timeout = setTimeout(() => privateRooms.delete(code), 5 * 60 * 1000);
       privateRooms.set(code, { ws, nickname, rank, timeout, mode });
@@ -224,6 +314,8 @@ wss.on('connection', (ws) => {
       privateRooms.delete(code);
       if (host.mode === 'coop') {
         createCoopRoom({ ws, nickname, rank }, { ws: host.ws, nickname: host.nickname, rank: host.rank });
+      } else if (host.mode === 'block') {
+        createBlockRoom({ ws: host.ws, nickname: host.nickname, rank: host.rank }, { ws, nickname, rank });
       } else {
         createRoom({ ws, nickname, rank }, { ws: host.ws, nickname: host.nickname, rank: host.rank });
       }
@@ -328,6 +420,51 @@ wss.on('connection', (ws) => {
       if (opp) wsSend(opp.ws, { type: 'opponentEmoji', emoji: data.emoji });
     }
 
+    // -- blockJoin: 2-player shared-board block mode matchmaking --
+    else if (data.type === 'blockJoin') {
+      const nickname = String(data.nickname || 'Player').trim().slice(0, 20) || 'Player';
+      const rank = (data.rank && typeof data.rank.name === 'string') ? { icon: String(data.rank.icon || '').slice(0, 8), name: String(data.rank.name).slice(0, 20) } : null;
+      ws._nickname = nickname;
+      ws._rank = rank;
+      for (let i = blockQueue.length - 1; i >= 0; i--) if (blockQueue[i].ws.readyState !== WebSocket.OPEN) blockQueue.splice(i, 1);
+      if (blockQueue.length > 0) createBlockRoom(blockQueue.shift(), { ws, nickname, rank });
+      else { wsSend(ws, { type: 'blockWaiting' }); blockQueue.push({ ws, nickname, rank }); }
+    }
+
+    // -- blockMove: shared board placement --
+    else if (data.type === 'blockMove') {
+      const roomId = ws._roomId;
+      if (roomId === null) return;
+      const room = rooms.get(roomId);
+      if (!room || room.type !== 'block' || room.ended) return;
+      const idx = ws._playerIdx;
+      const r = parseInt(data.r), c = parseInt(data.c);
+      if (idx !== room.turnIndex || !room.alive[idx]) return;
+      if (isNaN(r) || isNaN(c) || !validBlockMove(room, idx, r, c)) return;
+      const n = room.numbers[idx];
+      room.board[r][c] = { player: idx, n };
+      room.last[idx] = { r, c };
+      room.scores[idx]++;
+      room.numbers[idx]++;
+      blockBroadcast(room, { type: 'blockMove', playerIndex: idx, r, c, n, ...blockPayload(room) });
+      advanceBlockTurn(room);
+    }
+
+    // -- blockNoMoves: client reports being stuck --
+    else if (data.type === 'blockNoMoves') {
+      const roomId = ws._roomId;
+      if (roomId === null) return;
+      const room = rooms.get(roomId);
+      if (!room || room.type !== 'block' || room.ended) return;
+      const idx = ws._playerIdx;
+      if (!room.alive[idx] || blockHasMove(room, idx)) return;
+      room.alive[idx] = false;
+      blockBroadcast(room, { type: 'blockEliminated', playerIndex: idx, ...blockPayload(room) });
+      const alive = blockAliveIndexes(room);
+      if (alive.length <= 1) endBlockRoom(room, alive[0] ?? idx);
+      else advanceBlockTurn(room);
+    }
+
     // ── coopJoin: enter cooperative matchmaking ─────────────────
     else if (data.type === 'coopJoin') {
       const nickname = String(data.nickname || 'Player').trim().slice(0, 20) || 'Player';
@@ -420,19 +557,29 @@ wss.on('connection', (ws) => {
     const cqi = coopQueue.findIndex(p => p.ws === ws);
     if (cqi !== -1) { coopQueue.splice(cqi, 1); return; }
 
+    const bqi = blockQueue.findIndex(p => p.ws === ws);
+    if (bqi !== -1) { blockQueue.splice(bqi, 1); return; }
+
     // Notify opponent if mid-game
     const roomId = ws._roomId;
     if (roomId !== null) {
       const room = rooms.get(roomId);
       if (room) {
-        clearInterval(room.timerInterval);
-        room.players.forEach(p => {
-          if (p && p.ws !== ws && p.ws.readyState === WebSocket.OPEN) {
-            wsSend(p.ws, { type: 'opponentLeft' });
-            p.ws._roomId = null;
-          }
-        });
-        rooms.delete(roomId);
+        if (room.type === 'block') {
+          const idx = ws._playerIdx;
+          const alive = blockAliveIndexes(room).filter(i => i !== idx);
+          if (alive.length === 1) endBlockRoom(room, alive[0], 'disconnect');
+          else rooms.delete(roomId);
+        } else {
+          clearInterval(room.timerInterval);
+          room.players.forEach(p => {
+            if (p && p.ws !== ws && p.ws.readyState === WebSocket.OPEN) {
+              wsSend(p.ws, { type: 'opponentLeft' });
+              p.ws._roomId = null;
+            }
+          });
+          rooms.delete(roomId);
+        }
       }
     }
   });
