@@ -4,7 +4,7 @@ const cors       = require('cors');
 const WebSocket  = require('ws');
 const { insertScore, getTopScores, getRank, clearScores } = require('./db');
 
-const ADMIN_KEY   = process.env.ADMIN_KEY || 'gizli123';
+const ADMIN_KEY   = process.env.ADMIN_KEY;
 const VALID_MODES = ['serbest', 'surpriz'];
 
 const scoreRateLimit = new Map(); // ip -> lastSubmitMs
@@ -13,7 +13,11 @@ const app  = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors({
-  origin: ['https://rafibir.github.io', 'http://localhost:3001']
+  origin: function(origin, cb) {
+    const allowed = ['https://rafibir.github.io', 'http://localhost:3001', 'http://localhost:5500', 'http://127.0.0.1:5500'];
+    if (!origin || origin === 'null' || allowed.includes(origin)) cb(null, true);
+    else cb(new Error('Not allowed by CORS'));
+  }
 }));
 app.use(express.json());
 
@@ -70,6 +74,7 @@ app.post('/api/scores', async (req, res) => {
 // DELETE /api/scores?key=ADMIN_KEY&mode=serbest
 app.delete('/api/scores', async (req, res) => {
   try {
+    if (!ADMIN_KEY) return res.status(503).json({ error: 'Admin endpoint disabled.' });
     if (req.query.key !== ADMIN_KEY) return res.status(403).json({ error: 'Yetkisiz.' });
     const mode = VALID_MODES.includes(req.query.mode) ? req.query.mode : null;
     await clearScores(mode);
@@ -379,7 +384,7 @@ wss.on('connection', (ws) => {
 
   ws.on('message', (raw) => {
     let data;
-    try { data = JSON.parse(raw); } catch { return; }
+    try { data = JSON.parse(raw); } catch (e) { console.warn('[ws] invalid JSON from client', e.message, String(raw).slice(0, 200)); return; }
 
     // ── createPrivate: create a private room with invite code ───
     if (data.type === 'createPrivate') {
@@ -750,6 +755,8 @@ wss.on('connection', (ws) => {
       wsSend(ws, { type: 'pong' });
     }
   });
+
+  ws.on('error', () => {});
 
   ws.on('close', () => {
     // Remove from private room if waiting for a joiner
